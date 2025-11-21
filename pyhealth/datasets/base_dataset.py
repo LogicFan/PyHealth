@@ -6,10 +6,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 from urllib.parse import urlparse, urlunparse
+import functools
+import operator
 
 import polars as pl
+import dask.dataframe as dd
+from pyarrow import csv as pv
+from pyarrow import parquet as pq
+import pandas as pd
 import requests
 from tqdm import tqdm
+import platformdirs
 
 from ..data import Patient
 from ..tasks import BaseTask
@@ -55,26 +62,30 @@ def path_exists(path: str) -> bool:
     else:
         return Path(path).exists()
 
-
-def scan_csv_gz_or_csv_tsv(path: str) -> pl.LazyFrame:
+def parquet_path(path: str) -> str:
     """
-    Scan a CSV.gz, CSV, TSV.gz, or TSV file and returns a LazyFrame.
-    It will fall back to the other extension if not found.
-
-    Args:
-        path (str): URL or local path to a .csv, .csv.gz, .tsv, or .tsv.gz file
-
-    Returns:
-        pl.LazyFrame: The LazyFrame for the CSV.gz, CSV, TSV.gz, or TSV file.
+    Convert a CSV/TSV file path to a Parquet file path.
+    E.g., /path/to/file.csv.gz -> /path/to/file.parquet
     """
+    if path.endswith(".csv.gz"):
+        return path[:-7] + ".parquet"
+    elif path.endswith(".csv"):
+        return path[:-4] + ".parquet"
+    elif path.endswith(".tsv.gz"):
+        return path[:-7] + ".parquet"
+    elif path.endswith(".tsv"):
+        return path[:-4] + ".parquet"
+    else:
+        raise ValueError(f"Path does not have expected extension: {path}")
 
-    def scan_file(file_path: str) -> pl.LazyFrame:
-        separator = "\t" if ".tsv" in file_path else ","
-        return pl.scan_csv(file_path, separator=separator, infer_schema=False)
-
+def alt_path(path: str) -> str:
+    """
+    Normalize a path by checking for alternative extensions (.csv.gz, .csv, .tsv.gz, .tsv).
+    If the original path does not exist, it will try the alternative extension.
+    """
     if path_exists(path):
-        return scan_file(path)
-
+        return path
+    
     # Try the alternative extension
     if path.endswith(".csv.gz"):
         alt_path = path[:-3]  # Remove .gz -> try .csv
@@ -89,9 +100,40 @@ def scan_csv_gz_or_csv_tsv(path: str) -> pl.LazyFrame:
 
     if path_exists(alt_path):
         logger.info(f"Original path does not exist. Using alternative: {alt_path}")
-        return scan_file(alt_path)
+        return alt_path
 
     raise FileNotFoundError(f"Neither path exists: {path} or {alt_path}")
+
+def scan_csv_gz_or_csv_tsv(path: str) -> dd.DataFrame:
+    """
+    Scan a CSV.gz, CSV, TSV.gz, or TSV file and returns a LazyFrame.
+    It will fall back to the other extension if not found.
+
+    Args:
+        path (str): URL or local path to a .csv, .csv.gz, .tsv, or .tsv.gz file
+
+    Returns:
+        pl.LazyFrame: The LazyFrame for the CSV.gz, CSV, TSV.gz, or TSV file.
+    """
+
+    if not path_exists(parquet_path(path)):
+        # It it necessary to convert .gz file to .parquet file since Dask cannot split on gz files directly
+        path = alt_path(path)
+        delimiter = '\t' if path.endswith(".tsv") or path.endswith(".tsv.gz") else ','
+        csv_reader = pv.open_csv(
+            path, 
+            read_options=pv.ReadOptions(block_size=1 << 26), # 64 MB block size
+            parse_options=pv.ParseOptions(delimiter=delimiter)
+        )
+        with pq.ParquetWriter(parquet_path(path), csv_reader.schema) as writer:
+            for batch in csv_reader:
+                writer.write_batch(batch)
+
+    return dd.read_parquet(
+        parquet_path(path), 
+        split_row_groups=True,  # IMPORTANT
+        blocksize="64MB",
+    )
 
 
 class BaseDataset(ABC):
@@ -126,6 +168,9 @@ class BaseDataset(ABC):
         if len(set(tables)) != len(tables):
             logger.warning("Duplicate table names in tables list. Removing duplicates.")
             tables = list(set(tables))
+        if config_path is None:
+            raise ValueError("config_path must be provided")
+
         self.root = root
         self.tables = tables
         self.dataset_name = dataset_name or self.__class__.__name__
@@ -183,23 +228,23 @@ class BaseDataset(ABC):
 
         return self._collected_global_event_df
 
-    def load_data(self) -> pl.LazyFrame:
+    def load_data(self) -> dd.DataFrame:
         """Loads data from the specified tables.
 
         Returns:
-            pl.LazyFrame: A concatenated lazy frame of all tables.
+            dd.DataFrame: A concatenated lazy frame of all tables.
         """
         frames = [self.load_table(table.lower()) for table in self.tables]
-        return pl.concat(frames, how="diagonal")
+        return dd.concat(frames, axis=0, join="outer")
 
-    def load_table(self, table_name: str) -> pl.LazyFrame:
+    def load_table(self, table_name: str) -> dd.DataFrame:
         """Loads a table and processes joins if specified.
 
         Args:
             table_name (str): The name of the table to load.
 
         Returns:
-            pl.LazyFrame: The processed lazy frame for the table.
+            dd.DataFrame: The processed Dask dataframe for the table.
 
         Raises:
             ValueError: If the table is not found in the config.
@@ -208,21 +253,12 @@ class BaseDataset(ABC):
         if table_name not in self.config.tables:
             raise ValueError(f"Table {table_name} not found in config")
 
-        def _to_lower(col_name: str) -> str:
-            lower_name = col_name.lower()
-            if lower_name != col_name:
-                logger.warning("Renaming column %s to lowercase %s", col_name, lower_name)
-            return lower_name
-
         table_cfg = self.config.tables[table_name]
         csv_path = f"{self.root}/{table_cfg.file_path}"
         csv_path = clean_path(csv_path)
 
         logger.info(f"Scanning table: {table_name} from {csv_path}")
-        df = scan_csv_gz_or_csv_tsv(csv_path)
-
-        # Convert column names to lowercase before calling preprocess_func
-        df = df.rename(_to_lower)
+        df: dd.DataFrame = scan_csv_gz_or_csv_tsv(csv_path)
 
         # Check if there is a preprocessing function for this table
         preprocess_func = getattr(self, f"preprocess_{table_name}", None)
@@ -230,7 +266,7 @@ class BaseDataset(ABC):
             logger.info(
                 f"Preprocessing table: {table_name} with {preprocess_func.__name__}"
             )
-            df = preprocess_func(df)
+            df: dd.DataFrame = preprocess_func(df)
 
         # Handle joins
         for join_cfg in table_cfg.join:
@@ -238,12 +274,11 @@ class BaseDataset(ABC):
             other_csv_path = clean_path(other_csv_path)
             logger.info(f"Joining with table: {other_csv_path}")
             join_df = scan_csv_gz_or_csv_tsv(other_csv_path)
-            join_df = join_df.rename(_to_lower)
             join_key = join_cfg.on
             columns = join_cfg.columns
             how = join_cfg.how
 
-            df = df.join(join_df.select([join_key] + columns), on=join_key, how=how)
+            df: dd.DataFrame = df.merge(join_df[[join_key] + columns], on=join_key, how=how)
 
         patient_id_col = table_cfg.patient_id
         timestamp_col = table_cfg.timestamp
@@ -253,38 +288,34 @@ class BaseDataset(ABC):
         # Timestamp expression
         if timestamp_col:
             if isinstance(timestamp_col, list):
-                # Concatenate all timestamp parts in order with no separator
-                combined_timestamp = pl.concat_str(
-                    [pl.col(col) for col in timestamp_col]
-                ).str.strptime(pl.Datetime, format=timestamp_format, strict=True)
-                timestamp_expr = combined_timestamp
+                timestamp_series: dd.Series = functools.reduce(operator.add, (df[col].astype(str) for col in timestamp_col))
             else:
-                # Single timestamp column
-                timestamp_expr = pl.col(timestamp_col).str.strptime(
-                    pl.Datetime, format=timestamp_format, strict=True
+                timestamp_series: dd.Series = df[timestamp_col].astype(str)
+            timestamp_series: dd.Series = dd.to_datetime(
+                    timestamp_series,
+                    format=timestamp_format,
+                    errors="raise",
                 )
+            
+            df: dd.DataFrame = df.assign(timestamp=timestamp_series.astype("datetime64[ms]"))
         else:
-            timestamp_expr = pl.lit(None, dtype=pl.Datetime)
+            df: dd.DataFrame = df.assign(timestamp=pd.NaT)
 
         # If patient_id_col is None, use row index as patient_id
-        patient_id_expr = (
-            pl.col(patient_id_col).cast(pl.Utf8)
-            if patient_id_col
-            else pl.int_range(0, pl.count()).cast(pl.Utf8)
-        )
-        base_columns = [
-            patient_id_expr.alias("patient_id"),
-            pl.lit(table_name).cast(pl.Utf8).alias("event_type"),
-            # ms should be sufficient for most cases
-            timestamp_expr.cast(pl.Datetime(time_unit="ms")).alias("timestamp"),
-        ]
+        if patient_id_col:
+            df: dd.DataFrame = df.assign(patient_id=df[patient_id_col].astype(str))
+        else:
+            df: dd.DataFrame = df.reset_index(drop=True)
+            df: dd.DataFrame = df.assign(patient_id=df.index.astype(str))
 
-        # Flatten attribute columns with event_type prefix
-        attribute_columns = [
-            pl.col(attr.lower()).alias(f"{table_name}/{attr}") for attr in attribute_cols
-        ]
+        df: dd.DataFrame = df.assign(event_type=table_name)
 
-        event_frame = df.select(base_columns + attribute_columns)
+        rename_attr = {attr: f"{table_name}/{attr}" for attr in attribute_cols}
+        df: dd.DataFrame = df.rename(columns=rename_attr)
+
+        attr_cols = [rename_attr[attr] for attr in attribute_cols]
+        final_cols = ["patient_id", "event_type", "timestamp"] + attr_cols
+        event_frame = df[final_cols]
 
         return event_frame
 
