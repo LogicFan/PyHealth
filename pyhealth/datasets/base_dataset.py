@@ -132,9 +132,12 @@ class _OutOfCoreExecutor:
         l_path = Path(self.temp_dir) / f"{random_id}_l.parquet"
         r_path = Path(self.temp_dir) / f"{random_id}_r.parquet"
         
+        print(f">>>>>>>> Polars >>>>>>>>>")
         lhs.sink_parquet(str(l_path), compression="lz4", row_group_size=8192)
         rhs.sink_parquet(str(r_path), compression="lz4", row_group_size=8192)
+        print(f"<<<<<<<< Polars <<<<<<<<<")
 
+        print(f">>>>>>>> Dask >>>>>>>>")
         with LocalCluster(**self.kwargs) as cluster:
             with Client(cluster) as client:
                 l_dask = dd.read_parquet(str(l_path))
@@ -142,6 +145,7 @@ class _OutOfCoreExecutor:
                 res = l_dask.merge(r_dask, on=on, how=how)
                 out_path = Path(self.temp_dir) / f"{random_id}.parquet"
                 res.to_parquet(str(out_path), compression="lz4")
+        print(f"<<<<<<<< Dask <<<<<<<<<")
 
         # Clean up temporary files
         os.remove(l_path)
