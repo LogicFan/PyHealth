@@ -368,7 +368,8 @@ class BaseDataset(ABC):
                     logger.info("Enabling low memory mode with out-of-core executor. This will be slower.")
                     ooc = _OutOfCoreExecutor(
                         str(self.cache_dir / "tmp"),
-                        n_workers=4,
+                        n_workers=2,
+                        threads_per_worker=1,
                         memory_limit="8GB",
                     )
                 else:
