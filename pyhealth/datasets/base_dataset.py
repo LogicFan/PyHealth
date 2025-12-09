@@ -135,6 +135,8 @@ class _OutOfCoreExecutor:
         print(f">>>>>>>> Polars >>>>>>>>>")
         lhs.sink_parquet(str(l_path), compression="lz4", row_group_size=8192)
         rhs.sink_parquet(str(r_path), compression="lz4", row_group_size=8192)
+        del lhs
+        del rhs
         print(f"<<<<<<<< Polars <<<<<<<<<")
 
         print(f">>>>>>>> Dask >>>>>>>>")
@@ -174,6 +176,7 @@ class _OutOfCoreExecutor:
             path = Path(self.temp_dir) / f"{random_id}_{i}.parquet"
             frame.sink_parquet(str(path), compression="lz4", row_group_size=8192)
             paths.append(str(path))
+        del frames
 
         with LocalCluster(**self.kwargs) as cluster:
             with Client(cluster) as client:
@@ -374,7 +377,7 @@ class BaseDataset(ABC):
                         str(self.cache_dir / "tmp"),
                         n_workers=2,
                         threads_per_worker=1,
-                        memory_limit="8GB",
+                        memory_limit="12GB",
                     )
                 else:
                     ooc = None
