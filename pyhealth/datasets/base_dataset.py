@@ -10,6 +10,7 @@ import json
 import uuid
 import platformdirs
 import tempfile
+import shutil
 
 import litdata
 from litdata.streaming.item_loader import ParquetLoader
@@ -18,6 +19,8 @@ import pyarrow.parquet as pq
 import polars as pl
 import requests
 from tqdm import tqdm
+from dask.distributed import Client, LocalCluster
+import dask.dataframe as dd
 
 from ..data import Patient
 from ..tasks import BaseTask
@@ -110,6 +113,78 @@ def scan_csv_gz_or_csv_tsv(path: str) -> pl.LazyFrame:
 def _uncollate(x: list[Any]) -> Any:
     return x[0] if isinstance(x, list) and len(x) == 1 else x
 
+class _OutOfCoreExecutor:
+    """
+    A simple out-of-core executor using Dask. This is a workaround for Polars'
+    lack of built-in out-of-core execution support.
+    """
+
+    def __init__(self, temp_dir: str | None = None, **kwargs):
+        self.temp_dir = temp_dir or tempfile.mkdtemp()
+        self.kwargs = kwargs
+
+    def join(self, lhs: pl.LazyFrame, rhs: pl.LazyFrame, on: str, how: str) -> pl.LazyFrame:
+        """Perform out-of-core join using Dask."""
+        random_id = uuid.uuid4().hex
+
+        l_path = Path(self.temp_dir) / f"{random_id}_l.parquet"
+        r_path = Path(self.temp_dir) / f"{random_id}_r.parquet"
+        
+        lhs.sink_parquet(str(l_path), compression="lz4", row_group_size=8192)
+        rhs.sink_parquet(str(r_path), compression="lz4", row_group_size=8192)
+
+        with LocalCluster(**self.kwargs) as cluster:
+            with Client(cluster) as client:
+                l_dask = dd.read_parquet(str(l_path))
+                r_dask = dd.read_parquet(str(r_path))
+                res = l_dask.merge(r_dask, on=on, how=how)
+                out_path = Path(self.temp_dir) / f"{random_id}.parquet"
+                res.to_parquet(str(out_path), compression="lz4")
+
+        # Clean up temporary files
+        os.remove(l_path)
+        os.remove(r_path)
+        return pl.scan_parquet(str(out_path), low_memory=True)
+
+    def concat(self, frames: List[pl.LazyFrame], how: str = "diagonal") -> pl.LazyFrame:
+        """Perform out-of-core concatenation using Dask."""
+        random_id = uuid.uuid4().hex
+
+        if how == "diagonal":
+            axis = 0
+            join = "outer"
+        elif how == "vertical":
+            axis = 0
+            join = "inner"
+        elif how == "horizontal":
+            axis = 1
+            join = "inner"
+        else:
+            raise ValueError(f"Invalid concat how: {how}")
+
+        paths = []
+        for i, frame in enumerate(frames):
+            path = Path(self.temp_dir) / f"{random_id}_{i}.parquet"
+            frame.sink_parquet(str(path), compression="lz4", row_group_size=8192)
+            paths.append(str(path))
+
+        with LocalCluster(**self.kwargs) as cluster:
+            with Client(cluster) as client:
+                dask_frames = [dd.read_parquet(p) for p in paths]
+                res = dd.concat(dask_frames, axis=axis, join=join)
+                out_path = Path(self.temp_dir) / f"{random_id}.parquet"
+                res.to_parquet(str(out_path), compression="lz4")
+
+        # Clean up temporary files
+        for path in paths:
+            os.remove(path)
+
+        return pl.scan_parquet(str(out_path), low_memory=True)
+
+    def close(self):
+        """Clean up temporary directory."""
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
 class _ParquetWriter:
     """
@@ -207,6 +282,7 @@ class BaseDataset(ABC):
         dataset_name: Optional[str] = None,
         config_path: Optional[str] = None,
         cache_dir: str | Path | None = None,
+        low_memory: bool = False,
         dev: bool = False,
     ):
         """Initializes the BaseDataset.
@@ -225,6 +301,7 @@ class BaseDataset(ABC):
         self.tables = tables
         self.dataset_name = dataset_name or self.__class__.__name__
         self.dev = dev
+        self.low_memory = low_memory
         self.config = load_yaml_config(config_path) if config_path else None
 
         logger.info(
@@ -235,6 +312,7 @@ class BaseDataset(ABC):
         self._cache_dir = cache_dir
         self._global_event_df = None
         self._unique_patient_ids = None
+        self._ooc_executor = None
 
     @property
     def cache_dir(self) -> Path:
@@ -275,6 +353,14 @@ class BaseDataset(ABC):
         if self._global_event_df is None:
             path = self.cache_dir / "global_event_df.parquet"
             if not path.exists():
+                if self.low_memory:
+                    logger.info("Enabling low memory mode with out-of-core executor. This will be slower.")
+                    self._ooc_executor = _OutOfCoreExecutor(
+                        str(self.cache_dir / "tmp"),
+                        n_workers=4,
+                        memory_limit="8GB",
+                    )
+
                 df = self.load_data()
                 if self.dev:
                     logger.info("Dev mode enabled: limiting to 1000 patients")
@@ -292,6 +378,11 @@ class BaseDataset(ABC):
                     row_group_size=8_192,
                     maintain_order=True,  # Important for sorted writes
                 )
+
+                if self._ooc_executor is not None:
+                    self._ooc_executor.close()
+                    self._ooc_executor = None
+
             self._global_event_df = path
 
         return pl.scan_parquet(
@@ -308,7 +399,10 @@ class BaseDataset(ABC):
             pl.LazyFrame: A concatenated lazy frame of all tables.
         """
         frames = [self.load_table(table.lower()) for table in self.tables]
-        return pl.concat(frames, how="diagonal")
+        if self._ooc_executor is not None:
+            return self._ooc_executor.concat(frames, how="diagonal")
+        else:
+            return pl.concat(frames, how="diagonal")
 
     def load_table(self, table_name: str) -> pl.LazyFrame:
         """Loads a table and processes joins if specified.
@@ -357,7 +451,11 @@ class BaseDataset(ABC):
             columns = join_cfg.columns
             how = join_cfg.how
 
-            df = df.join(join_df.select([join_key] + columns), on=join_key, how=how)  # type: ignore
+            if self._ooc_executor is not None:
+                # Perform the join using out-of-core executor
+                df = self._ooc_executor.join(df, join_df.select([join_key] + columns), on=join_key, how=how)
+            else:
+                df = df.join(join_df.select([join_key] + columns), on=join_key, how=how)  # type: ignore
 
         patient_id_col = table_cfg.patient_id
         timestamp_col = table_cfg.timestamp

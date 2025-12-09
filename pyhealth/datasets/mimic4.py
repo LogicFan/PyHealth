@@ -232,6 +232,7 @@ class MIMIC4Dataset(BaseDataset):
         cxr_config_path: Optional[str] = None,
         dataset_name: str = "mimic4",
         dev: bool = False,
+        low_memory: bool = False,
         cache_dir: Optional[str] = None,
     ):
         log_memory_usage("Starting MIMIC4Dataset init")
@@ -251,6 +252,7 @@ class MIMIC4Dataset(BaseDataset):
             dataset_name=dataset_name,
             config_path=None,
             dev=dev,
+            low_memory=low_memory,
             cache_dir=cache_dir,
         )
 
@@ -269,6 +271,7 @@ class MIMIC4Dataset(BaseDataset):
                 config_path=ehr_config_path,
                 cache_dir=ehr_cache_dir,
                 dev=dev,
+                low_memory=low_memory,
             )
             log_memory_usage("After EHR dataset initialization")
 
@@ -284,6 +287,7 @@ class MIMIC4Dataset(BaseDataset):
                 config_path=note_config_path,
                 cache_dir=note_cache_dir,
                 dev=dev,
+                low_memory=low_memory,
             )
             log_memory_usage("After Note dataset initialization")
 
@@ -299,6 +303,7 @@ class MIMIC4Dataset(BaseDataset):
                 config_path=cxr_config_path,
                 cache_dir=cxr_cache_dir,
                 dev=dev,
+                low_memory=low_memory,
             )
             log_memory_usage("After CXR dataset initialization")
 
@@ -322,5 +327,7 @@ class MIMIC4Dataset(BaseDataset):
         logger.info("Creating combined dataframe")
         if len(frames) == 1:
             return frames[0]
+        elif self._ooc_executor is not None:
+            return self._ooc_executor.concat(frames, how="diagonal")
         else:
             return pl.concat(frames, how="diagonal")
