@@ -122,6 +122,7 @@ class _OutOfCoreExecutor:
     def __init__(self, temp_dir: str | None = None, **kwargs):
         self.temp_dir = temp_dir or tempfile.mkdtemp()
         self.kwargs = kwargs
+        os.makedirs(self.temp_dir, exist_ok=True)
 
     def join(self, lhs: pl.LazyFrame, rhs: pl.LazyFrame, on: str, how: str) -> pl.LazyFrame:
         """Perform out-of-core join using Dask."""
