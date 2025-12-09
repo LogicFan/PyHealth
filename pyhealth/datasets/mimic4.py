@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-from .base_dataset import BaseDataset
+from .base_dataset import BaseDataset, _OutOfCoreExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +309,7 @@ class MIMIC4Dataset(BaseDataset):
 
         log_memory_usage("Completed MIMIC4Dataset init")
 
-    def load_data(self) -> pl.LazyFrame:
+    def load_data(self, ooc: _OutOfCoreExecutor | None = None) -> pl.LazyFrame:
         """
         Combines data from all initialized sub-datasets into a unified global event dataframe.
 
@@ -321,13 +321,13 @@ class MIMIC4Dataset(BaseDataset):
         # Collect global event dataframes from all sub-datasets
         for dataset_type, dataset in self.sub_datasets.items():
             logger.info(f"Combining data from {dataset_type} dataset")
-            frames.append(dataset.load_data())
+            frames.append(dataset.load_data(ooc=ooc))
 
         # Concatenate all frames
         logger.info("Creating combined dataframe")
         if len(frames) == 1:
             return frames[0]
-        elif self._ooc_executor is not None:
-            return self._ooc_executor.concat(frames, how="diagonal")
+        elif ooc is not None:
+            return ooc.concat(frames, how="diagonal")
         else:
             return pl.concat(frames, how="diagonal")

@@ -125,6 +125,7 @@ class _OutOfCoreExecutor:
 
     def join(self, lhs: pl.LazyFrame, rhs: pl.LazyFrame, on: str, how: str) -> pl.LazyFrame:
         """Perform out-of-core join using Dask."""
+        print(f"Joining on {on} with how={how} using out-of-core executor...")
         random_id = uuid.uuid4().hex
 
         l_path = Path(self.temp_dir) / f"{random_id}_l.parquet"
@@ -148,6 +149,7 @@ class _OutOfCoreExecutor:
 
     def concat(self, frames: List[pl.LazyFrame], how: str = "diagonal") -> pl.LazyFrame:
         """Perform out-of-core concatenation using Dask."""
+        print(f"Concatenating {len(frames)} frames with how={how} using out-of-core executor...")
         random_id = uuid.uuid4().hex
 
         if how == "diagonal":
@@ -185,6 +187,15 @@ class _OutOfCoreExecutor:
         """Clean up temporary directory."""
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    # --------------------------------------------------------------
+    # Context manager support
+    # --------------------------------------------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
 class _ParquetWriter:
     """
@@ -312,7 +323,6 @@ class BaseDataset(ABC):
         self._cache_dir = cache_dir
         self._global_event_df = None
         self._unique_patient_ids = None
-        self._ooc_executor = None
 
     @property
     def cache_dir(self) -> Path:
@@ -355,13 +365,15 @@ class BaseDataset(ABC):
             if not path.exists():
                 if self.low_memory:
                     logger.info("Enabling low memory mode with out-of-core executor. This will be slower.")
-                    self._ooc_executor = _OutOfCoreExecutor(
+                    ooc = _OutOfCoreExecutor(
                         str(self.cache_dir / "tmp"),
                         n_workers=4,
                         memory_limit="8GB",
                     )
+                else:
+                    ooc = None
 
-                df = self.load_data()
+                df = self.load_data(ooc=ooc)
                 if self.dev:
                     logger.info("Dev mode enabled: limiting to 1000 patients")
                     limited_patients = (
@@ -379,9 +391,8 @@ class BaseDataset(ABC):
                     maintain_order=True,  # Important for sorted writes
                 )
 
-                if self._ooc_executor is not None:
-                    self._ooc_executor.close()
-                    self._ooc_executor = None
+                if ooc is not None:
+                    ooc.close()
 
             self._global_event_df = path
 
@@ -392,19 +403,19 @@ class BaseDataset(ABC):
             "patient_id"
         )  # Guarantee sorted read, see sink_parquet above
 
-    def load_data(self) -> pl.LazyFrame:
+    def load_data(self, ooc: _OutOfCoreExecutor | None = None) -> pl.LazyFrame:
         """Loads data from the specified tables.
 
         Returns:
             pl.LazyFrame: A concatenated lazy frame of all tables.
         """
-        frames = [self.load_table(table.lower()) for table in self.tables]
-        if self._ooc_executor is not None:
-            return self._ooc_executor.concat(frames, how="diagonal")
+        frames = [self.load_table(table.lower(), ooc=ooc) for table in self.tables]
+        if ooc is not None:
+            return ooc.concat(frames, how="diagonal")
         else:
             return pl.concat(frames, how="diagonal")
 
-    def load_table(self, table_name: str) -> pl.LazyFrame:
+    def load_table(self, table_name: str, ooc: _OutOfCoreExecutor | None = None) -> pl.LazyFrame:
         """Loads a table and processes joins if specified.
 
         Args:
@@ -451,9 +462,9 @@ class BaseDataset(ABC):
             columns = join_cfg.columns
             how = join_cfg.how
 
-            if self._ooc_executor is not None:
+            if ooc is not None:
                 # Perform the join using out-of-core executor
-                df = self._ooc_executor.join(df, join_df.select([join_key] + columns), on=join_key, how=how)
+                df = ooc.join(df, join_df.select([join_key] + columns), on=join_key, how=how)
             else:
                 df = df.join(join_df.select([join_key] + columns), on=join_key, how=how)  # type: ignore
 
