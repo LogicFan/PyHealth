@@ -484,7 +484,7 @@ class BaseDataset(ABC):
         patient_id_col = table_cfg.patient_id
         timestamp_col = table_cfg.timestamp
         # format None will blow up the memory
-        timestamp_format = table_cfg.timestamp_format or "YYYY-MM-DD HH:MM:SS"
+        timestamp_format = table_cfg.timestamp_format or "%Y-%m-%d %H:%M:%S"
         attribute_cols = table_cfg.attributes
 
         # Timestamp expression
