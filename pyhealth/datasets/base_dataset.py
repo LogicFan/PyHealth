@@ -21,6 +21,7 @@ import requests
 from tqdm import tqdm
 from dask.distributed import Client, LocalCluster
 import dask.dataframe as dd
+import dask.config
 
 from ..data import Patient
 from ..tasks import BaseTask
@@ -140,13 +141,19 @@ class _OutOfCoreExecutor:
         print(f"<<<<<<<< Polars <<<<<<<<<")
 
         print(f">>>>>>>> Dask >>>>>>>>")
-        with LocalCluster(**self.kwargs) as cluster:
-            with Client(cluster) as client:
-                l_dask = dd.read_parquet(str(l_path))
-                r_dask = dd.read_parquet(str(r_path))
-                res = l_dask.merge(r_dask, on=on, how=how)
-                out_path = Path(self.temp_dir) / f"{random_id}.parquet"
-                res.to_parquet(str(out_path), compression="lz4")
+        with dask.config.set({
+            "distributed.worker.memory.target": 0.1,
+            "distributed.worker.memory.spill": 0.2,
+            "distributed.worker.memory.pause": 0.6,
+            "distributed.worker.memory.terminate": 0.95,
+        }):
+            with LocalCluster(**self.kwargs) as cluster:
+                with Client(cluster) as client:
+                    l_dask = dd.read_parquet(str(l_path))
+                    r_dask = dd.read_parquet(str(r_path))
+                    res = l_dask.merge(r_dask, on=on, how=how)
+                    out_path = Path(self.temp_dir) / f"{random_id}.parquet"
+                    res.to_parquet(str(out_path), compression="lz4")
         print(f"<<<<<<<< Dask <<<<<<<<<")
 
         # Clean up temporary files
@@ -181,12 +188,18 @@ class _OutOfCoreExecutor:
         print(f"<<<<<<<< Polars <<<<<<<<<")
 
         print(f">>>>>>>> Dask >>>>>>>>>")
-        with LocalCluster(**self.kwargs) as cluster:
-            with Client(cluster) as client:
-                dask_frames = [dd.read_parquet(p) for p in paths]
-                res = dd.concat(dask_frames, axis=axis, join=join)
-                out_path = Path(self.temp_dir) / f"{random_id}.parquet"
-                res.to_parquet(str(out_path), compression="lz4")
+        with dask.config.set({
+            "distributed.worker.memory.target": 0.1,
+            "distributed.worker.memory.spill": 0.2,
+            "distributed.worker.memory.pause": 0.6,
+            "distributed.worker.memory.terminate": 0.95,
+        }):
+            with LocalCluster(**self.kwargs) as cluster:
+                with Client(cluster) as client:
+                    dask_frames = [dd.read_parquet(p) for p in paths]
+                    res = dd.concat(dask_frames, axis=axis, join=join)
+                    out_path = Path(self.temp_dir) / f"{random_id}.parquet"
+                    res.to_parquet(str(out_path), compression="lz4")
         print(f"<<<<<<<< Dask <<<<<<<<<")
 
         # Clean up temporary files
