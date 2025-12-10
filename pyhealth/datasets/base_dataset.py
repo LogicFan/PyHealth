@@ -196,7 +196,7 @@ class _OutOfCoreExecutor:
         }):
             with LocalCluster(**self.kwargs) as cluster:
                 with Client(cluster) as client:
-                    dask_frames = [dd.read_parquet(p) for p in paths]
+                    dask_frames = [dd.read_parquet(p).repartition(npartitions=30) for p in paths]
                     res = dd.concat(dask_frames, axis=axis, join=join)
                     out_path = Path(self.temp_dir) / f"{random_id}.parquet"
                     res.to_parquet(str(out_path), compression="lz4")
